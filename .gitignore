@@ -1,0 +1,9 @@
+.superpowers/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+.pio/
+firmware/.pio/
+firmware/include/codelet_secrets.h
