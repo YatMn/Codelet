@@ -23,6 +23,14 @@ enum class RenderMode : uint8_t {
   Partial,
 };
 
+struct DevicePowerStatus {
+  int batteryPercent;
+  bool charging;
+  bool known;
+};
+
+constexpr DevicePowerStatus UnknownDevicePowerStatus{-1, false, false};
+
 class DrawSink {
  public:
   virtual ~DrawSink() = default;
@@ -47,9 +55,9 @@ Rect contentRegion();
 
 RenderStyle styleForStatus(CodeletStatus status);
 void renderHome(DrawSink &sink, const Layout &layout, const CodeletSnapshot &snapshot,
-                RenderMode mode = RenderMode::Full);
+                RenderMode mode = RenderMode::Full, DevicePowerStatus power = UnknownDevicePowerStatus);
 void renderThreads(DrawSink &sink, const Layout &layout, const CodeletSnapshot &snapshot,
-                   RenderMode mode = RenderMode::Full);
+                   RenderMode mode = RenderMode::Full, DevicePowerStatus power = UnknownDevicePowerStatus);
 void renderProjectDetail(DrawSink &sink, const Layout &layout, const CodeletSnapshot &snapshot, const char *projectId,
-                         RenderMode mode = RenderMode::Full);
+                         RenderMode mode = RenderMode::Full, DevicePowerStatus power = UnknownDevicePowerStatus);
 void renderStatusPage(DrawSink &sink, const Layout &layout, const char *state, const char *detail, const char *hint);

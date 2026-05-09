@@ -293,6 +293,47 @@ const char *primaryQuotaLabel(const CodeletSnapshot &snapshot) {
   return snapshot.quotaBuckets[0].label;
 }
 
+bool batteryPercentIsKnown(DevicePowerStatus power) {
+  return power.known && power.batteryPercent >= 0 && power.batteryPercent <= 100;
+}
+
+void formatBatteryPercent(DevicePowerStatus power, char *buffer, size_t bufferSize) {
+  if (bufferSize == 0) return;
+  if (!batteryPercentIsKnown(power)) {
+    snprintf(buffer, bufferSize, "--%%");
+    return;
+  }
+  snprintf(buffer, bufferSize, "%d%%", power.batteryPercent);
+}
+
+void drawBatteryIndicator(DrawSink &sink, Rect slot, DevicePowerStatus power) {
+  sink.fillRect(slot, GrayPaper);
+
+  Rect outline = {slot.x, static_cast<int16_t>(slot.y + 2), 62, 16};
+  Rect cap = {static_cast<int16_t>(outline.x + outline.w), static_cast<int16_t>(outline.y + 5), 4, 6};
+  sink.drawRect(outline, {false, false, false});
+  sink.fillRect(cap, GrayBlack);
+
+  if (batteryPercentIsKnown(power)) {
+    int percent = clampPercent(power.batteryPercent);
+    int fillWidth = (outline.w - 4) * percent / 100;
+    if (fillWidth > 0) {
+      Rect fill = {static_cast<int16_t>(outline.x + 2), static_cast<int16_t>(outline.y + 2),
+                   static_cast<int16_t>(fillWidth), static_cast<int16_t>(outline.h - 4)};
+      sink.fillRect(fill, GrayBlack);
+      if (power.charging) {
+        for (int16_t x = fill.x + 4; x < fill.x + fill.w; x += 8) {
+          sink.drawLine(x, static_cast<int16_t>(fill.y + fill.h), static_cast<int16_t>(x + 6), fill.y, GrayPaper);
+        }
+      }
+    }
+  }
+
+  char percent[8];
+  formatBatteryPercent(power, percent, sizeof(percent));
+  drawClippedText(sink, {static_cast<int16_t>(slot.x + 68), slot.y, 52, 22}, percent, TextRole::MetaText);
+}
+
 const char *prototypeStatusLabel(CodeletStatus status) {
   switch (status) {
     case CodeletStatus::ApprovalRequired: return "! ASK";
@@ -355,7 +396,7 @@ void renderQuota(DrawSink &sink, const Layout &layout, const CodeletSnapshot &sn
 }
 
 void renderTopChrome(DrawSink &sink, const Layout &layout, const CodeletSnapshot &snapshot, const char *activeLabel,
-                     RenderMode mode) {
+                     RenderMode mode, DevicePowerStatus power) {
   if (!isFull(mode)) {
     sink.fillRect(layout.header, GrayPaper);
   }
@@ -365,6 +406,9 @@ void renderTopChrome(DrawSink &sink, const Layout &layout, const CodeletSnapshot
   drawClippedText(sink, {static_cast<int16_t>(layout.header.x + 254), static_cast<int16_t>(layout.header.y + 12),
                          110, 22},
                   CODELET_FIRMWARE_LABEL, TextRole::MetaText);
+  drawBatteryIndicator(sink, {static_cast<int16_t>(layout.header.x + 254),
+                              static_cast<int16_t>(layout.header.y + 42), 128, 22},
+                       power);
   char summary[88];
   snprintf(summary, sizeof(summary), "%d projects . %d sessions . %d need attention",
            snapshot.projectCount, snapshot.threadCount, snapshot.needAttentionCount);
@@ -536,7 +580,8 @@ RenderStyle styleForStatus(CodeletStatus status) {
   };
 }
 
-void renderHome(DrawSink &sink, const Layout &layout, const CodeletSnapshot &snapshot, RenderMode mode) {
+void renderHome(DrawSink &sink, const Layout &layout, const CodeletSnapshot &snapshot, RenderMode mode,
+                DevicePowerStatus power) {
   prepareFrame(sink, mode);
   renderQuota(sink, layout, snapshot, mode);
   if (!isFull(mode)) {
@@ -551,7 +596,7 @@ void renderHome(DrawSink &sink, const Layout &layout, const CodeletSnapshot &sna
     const ProjectView *project = static_cast<size_t>(i) < visibleCount ? &snapshot.projects[i] : nullptr;
     renderHomeCard(sink, layout.homeCards[i], project, mode);
   }
-  renderTopChrome(sink, layout, snapshot, "Projects", mode);
+  renderTopChrome(sink, layout, snapshot, "Projects", mode, power);
   if (isFull(mode)) {
     sink.commit(screenRect());
   } else {
@@ -562,7 +607,8 @@ void renderHome(DrawSink &sink, const Layout &layout, const CodeletSnapshot &sna
   }
 }
 
-void renderThreads(DrawSink &sink, const Layout &layout, const CodeletSnapshot &snapshot, RenderMode mode) {
+void renderThreads(DrawSink &sink, const Layout &layout, const CodeletSnapshot &snapshot, RenderMode mode,
+                   DevicePowerStatus power) {
   prepareFrame(sink, mode);
   renderQuota(sink, layout, snapshot, mode);
   if (!isFull(mode)) {
@@ -577,7 +623,7 @@ void renderThreads(DrawSink &sink, const Layout &layout, const CodeletSnapshot &
   for (size_t i = 0; i < visibleCount; i++) {
     renderThreadTableRow(sink, rowRect(body, static_cast<int>(i), 56, 56), snapshot.threads[i]);
   }
-  renderTopChrome(sink, layout, snapshot, "Threads", mode);
+  renderTopChrome(sink, layout, snapshot, "Threads", mode, power);
   if (isFull(mode)) {
     sink.commit(screenRect());
   } else {
@@ -587,7 +633,7 @@ void renderThreads(DrawSink &sink, const Layout &layout, const CodeletSnapshot &
 }
 
 void renderProjectDetail(DrawSink &sink, const Layout &layout, const CodeletSnapshot &snapshot, const char *projectId,
-                         RenderMode mode) {
+                         RenderMode mode, DevicePowerStatus power) {
   prepareFrame(sink, mode);
   renderQuota(sink, layout, snapshot, mode);
   if (!isFull(mode)) {
@@ -651,7 +697,7 @@ void renderProjectDetail(DrawSink &sink, const Layout &layout, const CodeletSnap
     rowIndex++;
   }
 
-  renderTopChrome(sink, layout, snapshot, "Projects", mode);
+  renderTopChrome(sink, layout, snapshot, "Projects", mode, power);
   if (isFull(mode)) {
     sink.commit(screenRect());
   } else {

@@ -1,5 +1,6 @@
 #ifndef CODELET_NATIVE_TEST
 #include <Arduino.h>
+#include <esp_system.h>
 #include <HTTPClient.h>
 #include <M5Unified.h>
 #include <WiFi.h>
@@ -9,6 +10,8 @@
 #include "codelet_config_store.h"
 #include "codelet_config.h"
 #include "codelet_layout.h"
+#include "codelet_power_input.h"
+#include "codelet_power_intent.h"
 #include "codelet_renderer.h"
 #include "codelet_runtime_config.h"
 #include "codelet_setup_flow.h"
@@ -131,6 +134,7 @@ class DeviceSetupValidator : public SetupConnectionValidator {
 };
 
 PreferencesRuntimeConfigStore configStore;
+PreferencesPowerIntentStore powerIntentStore;
 RuntimeConfig runtimeConfig = defaultRuntimeConfig();
 char runtimeBaseUrl[CODELET_AGENT_BASE_URL_LEN] = "";
 CodeletClient client(&transport, runtimeBaseUrl, runtimeConfig.apiToken);
@@ -141,6 +145,7 @@ CodeletApp app;
 Layout layout;
 CodeletSnapshot pendingSnapshot;
 uint32_t lastPollMs = 0;
+ShutdownHoldTracker shutdownHoldTracker;
 
 class M5DrawSink : public DrawSink {
  public:
@@ -254,17 +259,21 @@ void setDisplayModeForRender(RenderMode mode) {
   M5.Display.setEpdMode(mode == RenderMode::Full ? epd_mode_t::epd_quality : epd_mode_t::epd_text);
 }
 
+DevicePowerStatus currentDevicePowerStatus();
+void clearShutdownIntentMarker();
+
 void renderCurrentPage(RenderMode mode) {
   setDisplayModeForRender(mode);
+  DevicePowerStatus power = currentDevicePowerStatus();
   switch (app.page()) {
     case AppPage::Home:
-      renderHome(sink, layout, app.snapshot(), mode);
+      renderHome(sink, layout, app.snapshot(), mode, power);
       break;
     case AppPage::Threads:
-      renderThreads(sink, layout, app.snapshot(), mode);
+      renderThreads(sink, layout, app.snapshot(), mode, power);
       break;
     case AppPage::ProjectDetail:
-      renderProjectDetail(sink, layout, app.snapshot(), app.selectedProjectId(), mode);
+      renderProjectDetail(sink, layout, app.snapshot(), app.selectedProjectId(), mode, power);
       break;
     case AppPage::Offline:
       renderStatusPage(sink, layout, "AGENT OFFLINE", "Desktop Agent unreachable", runtimeBaseUrl);
@@ -276,6 +285,13 @@ void renderCurrentPage(RenderMode mode) {
       renderStatusPage(sink, layout, "DATA STALE", "Last good snapshot is too old", runtimeBaseUrl);
       break;
   }
+}
+
+DevicePowerStatus currentDevicePowerStatus() {
+  int battery = M5.Power.getBatteryLevel();
+  bool known = battery >= 0 && battery <= 100;
+  bool charging = static_cast<int>(M5.Power.isCharging()) == 1;
+  return {battery, charging, known};
 }
 
 void renderSetupScreen(const char *status) {
@@ -306,6 +322,13 @@ void renderShutdownAndPowerOff() {
   M5.Display.waitDisplay();
   delay(250);
   M5.Power.powerOff();
+}
+
+void requestShutdown(const char *reason) {
+  Serial.println(reason == nullptr ? "shutdown_requested" : reason);
+  clearShutdownIntentMarker();
+  Serial.flush();
+  renderShutdownAndPowerOff();
 }
 
 bool isTopLeftTouchHeld() {
@@ -362,6 +385,64 @@ void connectWifi() {
   WiFi.begin(runtimeConfig.wifiSsid, runtimeConfig.wifiPassword);
 }
 
+CodeletResetReason currentResetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return CodeletResetReason::PowerOn;
+    case ESP_RST_EXT: return CodeletResetReason::External;
+    case ESP_RST_SW: return CodeletResetReason::Software;
+    case ESP_RST_PANIC: return CodeletResetReason::Panic;
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT: return CodeletResetReason::Watchdog;
+    case ESP_RST_DEEPSLEEP: return CodeletResetReason::DeepSleep;
+    case ESP_RST_BROWNOUT: return CodeletResetReason::Brownout;
+#if defined(ESP_RST_USB)
+    case ESP_RST_USB: return CodeletResetReason::Usb;
+#endif
+#if defined(ESP_RST_JTAG)
+    case ESP_RST_JTAG: return CodeletResetReason::Jtag;
+#endif
+#if defined(ESP_RST_PWR_GLITCH)
+    case ESP_RST_PWR_GLITCH: return CodeletResetReason::PowerGlitch;
+#endif
+    default: return CodeletResetReason::Unknown;
+  }
+}
+
+void clearShutdownIntentMarker() {
+  if (!powerIntentStore.clearShutdownArmed()) {
+    Serial.println("shutdown_intent_clear_failed");
+  }
+}
+
+void armShutdownIntentMarker() {
+  if (!powerIntentStore.saveShutdownArmed(true)) {
+    Serial.println("shutdown_intent_arm_failed");
+  }
+}
+
+bool maybeShutdownFromBootPowerIntent() {
+  bool shutdownArmed = false;
+  bool markerLoaded = powerIntentStore.loadShutdownArmed(shutdownArmed);
+  CodeletResetReason resetReason = currentResetReason();
+  Serial.printf("reset_reason=%s shutdown_armed=%d marker_loaded=%d\n",
+                resetReasonName(resetReason), shutdownArmed ? 1 : 0, markerLoaded ? 1 : 0);
+
+  BootPowerIntentDecision decision = decideBootPowerIntent(shutdownArmed, resetReason);
+  if (!decision.shutdownRequested) {
+    return false;
+  }
+
+  Serial.println(decision.reason);
+  clearShutdownIntentMarker();
+  renderStatusPage(sink, layout, "SHUTTING DOWN", "Physical key requested power off", "Press side power to start");
+  M5.Display.waitDisplay();
+  Serial.flush();
+  delay(150);
+  M5.Power.powerOff();
+  return true;
+}
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -372,6 +453,10 @@ void setup() {
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextWrap(false);
   M5.Display.setEpdMode(epd_mode_t::epd_quality);
+
+  if (maybeShutdownFromBootPowerIntent()) {
+    return;
+  }
 
   bool manualSetup = isTopLeftTouchHeld();
   SetupStartDecision setupDecision = setupFlow.begin(manualSetup);
@@ -387,11 +472,17 @@ void setup() {
   }
 
   renderStatusPage(sink, layout, "STARTING", "Wi-Fi connecting", runtimeBaseUrl);
+  armShutdownIntentMarker();
   connectWifi();
 }
 
 void loop() {
   M5.update();
+  if (M5.BtnPWR.wasClicked()) {
+    requestShutdown("power_button_shutdown");
+    return;
+  }
+
   if (setupServer.isRunning()) {
     setupServer.handleClient();
     if (setupFlow.state() == SetupState::Succeeded) {
@@ -402,6 +493,7 @@ void loop() {
         return;
       }
       renderStatusPage(sink, layout, "STARTING", "Wi-Fi connecting", runtimeBaseUrl);
+      armShutdownIntentMarker();
       connectWifi();
       renderCurrentPage(RenderMode::Full);
       app.markRefreshed(millis(), RefreshMode::Full);
@@ -413,8 +505,14 @@ void loop() {
 
   uint32_t now = millis();
   auto touch = M5.Touch.getDetail();
-  if (M5.BtnPWR.wasPressed()) {
-    renderShutdownAndPowerOff();
+  PowerTouchSample shutdownTouch{
+      static_cast<int16_t>(touch.x),
+      static_cast<int16_t>(touch.y),
+      touch.isPressed(),
+  };
+  if (shutdownHoldTracker.update(shutdownTouch, now)) {
+    requestShutdown("touch_hold_shutdown");
+    return;
   }
   if (touch.wasClicked() || touch.wasFlicked()) {
     TouchEvent event{};
