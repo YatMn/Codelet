@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Protocol
 
 from codelet_agent.models import (
+    ProjectSnapshot,
     QuotaBucket,
     QuotaSnapshot,
     ServerSnapshot,
@@ -26,17 +29,24 @@ def build_snapshot(
     mute_until: datetime | None = None,
 ) -> Snapshot:
     now = datetime.now(timezone.utc)
-    threads = sort_threads(adapter.load_threads())
-    projects = aggregate_projects(threads)
+    threads = sort_threads(_with_thread_display_versions(adapter.load_threads()))
+    projects = _with_project_display_versions(aggregate_projects(threads))
 
     load_quota = getattr(adapter, "load_quota", None)
     quota = load_quota(now) if callable(load_quota) else _build_quota(now)
+    snapshot_version = _snapshot_version(
+        threads=threads,
+        projects=projects,
+        quota=quota,
+        sound_enabled=sound_enabled,
+        mute_until=mute_until,
+    )
 
     return Snapshot(
         server=ServerSnapshot(
             status="ok",
             now=now,
-            snapshot_version=SNAPSHOT_VERSION,
+            snapshot_version=snapshot_version,
             privacy_mode=privacy_mode,
             sound_enabled=sound_enabled,
             mute_until=mute_until,
@@ -48,6 +58,102 @@ def build_snapshot(
         threads=threads,
         alerts=[],
     )
+
+
+def _with_thread_display_versions(threads: list[ThreadSnapshot]) -> list[ThreadSnapshot]:
+    return [
+        thread.model_copy(
+            update={
+                "display_version": _stable_version(
+                    {
+                        "id": thread.id,
+                        "project_id": thread.project_id,
+                        "source": thread.source,
+                        "title": thread.title,
+                        "status": thread.status.value,
+                        "last_event": thread.last_event,
+                        "approval_required": thread.approval_required,
+                        "error_summary": thread.error_summary,
+                        "completed_at": _datetime_or_none(thread.completed_at),
+                    }
+                )
+            }
+        )
+        for thread in threads
+    ]
+
+
+def _with_project_display_versions(projects: list[ProjectSnapshot]) -> list[ProjectSnapshot]:
+    return [
+        project.model_copy(
+            update={
+                "display_version": _stable_version(
+                    {
+                        "id": project.id,
+                        "alias": project.alias,
+                        "path_hint": project.path_hint,
+                        "state": project.state.value,
+                        "thread_count": project.thread_count,
+                        "counts": project.counts,
+                        "recent_threads": [
+                            {
+                                "id": thread.id,
+                                "status": thread.status.value,
+                                "display_version": thread.display_version,
+                            }
+                            for thread in project.recent_threads
+                        ],
+                    }
+                )
+            }
+        )
+        for project in projects
+    ]
+
+
+def _snapshot_version(
+    *,
+    threads: list[ThreadSnapshot],
+    projects: list[ProjectSnapshot],
+    quota: QuotaSnapshot,
+    sound_enabled: bool,
+    mute_until: datetime | None,
+) -> int:
+    return _stable_version(
+        {
+            "schema": SNAPSHOT_VERSION,
+            "sound_enabled": sound_enabled,
+            "mute_until": _datetime_or_none(mute_until),
+            "quota": [
+                {
+                    "kind": bucket.kind,
+                    "label": bucket.label,
+                    "used_percent": bucket.used_percent,
+                    "remaining_percent": bucket.remaining_percent,
+                    "status": bucket.status,
+                }
+                for bucket in quota.buckets
+            ],
+            "projects": [
+                {"id": project.id, "display_version": project.display_version}
+                for project in projects
+            ],
+            "threads": [
+                {"id": thread.id, "display_version": thread.display_version}
+                for thread in threads
+            ],
+        }
+    )
+
+
+def _stable_version(payload: object) -> int:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    unsigned = int(hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:8], 16)
+    return unsigned % 2_147_483_647 or 1
+
+
+def _datetime_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
 
 
 def _build_quota(now: datetime) -> QuotaSnapshot:

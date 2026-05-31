@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from codelet_agent.models import JsonDict, QuotaBucket, QuotaSnapshot, Status, ThreadSnapshot, priority_for_status
 from codelet_agent.privacy import sanitize_text
@@ -15,6 +16,18 @@ CODEX_SOURCE = "codex_desktop"
 DISPLAY_VERSION = 1
 TEXT_PREVIEW_CHARS = 240
 TOOL_OUTPUT_PREVIEW_CHARS = 500
+DEFAULT_QUOTA_CACHE_TTL_SEC = 60
+STALE_AFTER_SEC = 30 * 60
+LONG_RUNNING_AFTER_SEC = 60 * 60
+APPROVAL_REQUIRED_EVENT_TYPES = {"approval_required", "approval_request"}
+APPROVAL_REQUIRED_MARKERS = (
+    "approval required",
+    "requires approval",
+    "need your approval",
+    "needs approval",
+    "需要批准",
+    "需要你批准",
+)
 AWAITING_USER_MARKERS = ("确认", "reply", "need your reply", "needs reply", "等待", "继续吗")
 FAILED_MARKERS = ("failed", "error", "traceback")
 EXIT_CODE_RE = re.compile(r"exit(?:ed)?(?:_code| with code)?[:= ]+(-?\d+)", re.IGNORECASE)
@@ -39,13 +52,23 @@ class _SessionFacts:
 
 
 class CodexLocalAdapter:
-    def __init__(self, codex_home: Path | None = None) -> None:
+    def __init__(
+        self,
+        codex_home: Path | None = None,
+        *,
+        quota_cache_ttl_sec: int = DEFAULT_QUOTA_CACHE_TTL_SEC,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.codex_home = codex_home or Path.home() / ".codex"
+        self.quota_cache_ttl_sec = max(0, quota_cache_ttl_sec)
+        self._monotonic = monotonic
+        self._quota_rate_limit_cache: tuple[float, JsonDict | None] | None = None
 
-    def load_threads(self, *, limit: int = 20) -> list[ThreadSnapshot]:
+    def load_threads(self, *, limit: int = 20, now: datetime | None = None) -> list[ThreadSnapshot]:
         if limit <= 0:
             return []
 
+        current_time = _normalize_datetime(now) or datetime.now(timezone.utc)
         entries = _read_index(self.codex_home / "session_index.jsonl", limit=None)
         candidates = _session_candidates(self.codex_home)
         threads: list[ThreadSnapshot] = []
@@ -55,16 +78,30 @@ class CodexLocalAdapter:
             if session_path and _is_subagent_session(session_path):
                 continue
             facts = _read_session_facts(session_path) if session_path else None
-            threads.append(_build_thread(entry, facts))
+            threads.append(_build_thread(entry, facts, current_time))
             if len(threads) >= limit:
                 break
 
         return threads
 
     def load_quota(self, now: datetime) -> QuotaSnapshot:
+        latest_rate_limit = self._cached_latest_rate_limit()
+        if latest_rate_limit is None:
+            return _unknown_quota(now)
+        return _quota_from_rate_limit(latest_rate_limit, now)
+
+    def _cached_latest_rate_limit(self) -> JsonDict | None:
+        cache_now = self._monotonic()
+        if self._quota_rate_limit_cache is not None:
+            cached_at, cached_rate_limit = self._quota_rate_limit_cache
+            if cache_now - cached_at < self.quota_cache_ttl_sec:
+                return cached_rate_limit
+
         latest: tuple[datetime, JsonDict] | None = None
 
-        for path in _session_candidates(self.codex_home):
+        for path, modified_ts in _session_candidates_by_mtime(self.codex_home):
+            if latest is not None and modified_ts <= latest[0].timestamp():
+                break
             for record in _iter_jsonl(path):
                 payload = record.get("payload")
                 if not isinstance(payload, dict):
@@ -80,9 +117,9 @@ class CodexLocalAdapter:
                 if latest is None or event_time > latest[0]:
                     latest = (event_time, rate_limit)
 
-        if latest is None:
-            return _unknown_quota(now)
-        return _quota_from_rate_limit(latest[1], now)
+        latest_rate_limit = latest[1] if latest is not None else None
+        self._quota_rate_limit_cache = (cache_now, latest_rate_limit)
+        return latest_rate_limit
 
 
 def _read_index(path: Path, *, limit: int | None) -> list[_IndexEntry]:
@@ -125,6 +162,17 @@ def _session_candidates(codex_home: Path) -> list[Path]:
         if root.exists():
             candidates.extend(path for path in root.rglob("*.jsonl") if path.is_file())
     return candidates
+
+
+def _session_candidates_by_mtime(codex_home: Path) -> list[tuple[Path, float]]:
+    candidates = []
+    for path in _session_candidates(codex_home):
+        try:
+            modified_ts = path.stat().st_mtime
+        except OSError:
+            modified_ts = 0.0
+        candidates.append((path, modified_ts))
+    return sorted(candidates, key=lambda item: item[1], reverse=True)
 
 
 def _find_session_file(session_id: str, candidates: list[Path]) -> Path | None:
@@ -336,7 +384,9 @@ def _read_session_facts(path: Path) -> _SessionFacts:
             text = _assistant_text(payload)
             if text:
                 last_event = text
-            if text and _looks_failed(text):
+            if text and _looks_approval_required(text):
+                status_signal = Status.APPROVAL_REQUIRED
+            elif text and _looks_failed(text):
                 status_signal = Status.FAILED
             elif text and _looks_awaiting_user(text):
                 status_signal = Status.AWAITING_USER
@@ -350,7 +400,9 @@ def _read_session_facts(path: Path) -> _SessionFacts:
             text = _assistant_text(payload)
             if text:
                 last_event = text
-            if text and _looks_failed(text):
+            if text and _looks_approval_required(text):
+                status_signal = Status.APPROVAL_REQUIRED
+            elif text and _looks_failed(text):
                 status_signal = Status.FAILED
             elif text and _looks_awaiting_user(text):
                 status_signal = Status.AWAITING_USER
@@ -361,30 +413,39 @@ def _read_session_facts(path: Path) -> _SessionFacts:
         if record_type == "event_msg":
             event_type = _string_or_none(payload.get("type"))
             event_failed = _event_exit_code_failed(payload)
-            if event_failed:
+            event_status: Status | None = None
+            if event_type in APPROVAL_REQUIRED_EVENT_TYPES:
+                last_event = _short_event_message(payload) or "approval required"
+                event_status = Status.APPROVAL_REQUIRED
+            elif event_failed:
                 last_event = _event_exit_code_summary(payload)
-                status_signal = Status.FAILED
-            if not event_failed and event_type == "task_complete":
+                event_status = Status.FAILED
+            if event_status is None and not event_failed and event_type == "task_complete":
                 last_event = "task complete"
-                status_signal = Status.COMPLETED
-            if not event_failed and payload.get("phase") == "final_answer":
-                status_signal = Status.COMPLETED
+                event_status = Status.COMPLETED
+            if event_status is None and not event_failed and payload.get("phase") == "final_answer":
+                event_status = Status.COMPLETED
             message = _short_event_message(payload)
             if message:
-                if _looks_failed(message):
+                if _looks_approval_required(message):
                     last_event = message
-                    status_signal = Status.FAILED
-                elif status_signal == Status.FAILED:
+                    event_status = Status.APPROVAL_REQUIRED
+                elif _looks_failed(message):
+                    last_event = message
+                    event_status = Status.FAILED
+                elif event_status == Status.FAILED:
                     pass
                 elif _looks_awaiting_user(message):
                     last_event = message
-                    status_signal = Status.AWAITING_USER
+                    event_status = Status.AWAITING_USER
                 elif payload.get("phase") == "final_answer":
                     last_event = message
-                    status_signal = Status.COMPLETED
+                    event_status = Status.COMPLETED
                 else:
                     last_event = message
-                    status_signal = Status.RUNNING
+                    event_status = Status.RUNNING
+            if event_status is not None:
+                status_signal = event_status
 
     status = status_signal or Status.UNKNOWN
     return _SessionFacts(
@@ -396,8 +457,8 @@ def _read_session_facts(path: Path) -> _SessionFacts:
     )
 
 
-def _build_thread(entry: _IndexEntry, facts: _SessionFacts | None) -> ThreadSnapshot:
-    status = facts.status if facts else Status.UNKNOWN
+def _build_thread(entry: _IndexEntry, facts: _SessionFacts | None, now: datetime) -> ThreadSnapshot:
+    status = _status_at_time(facts, now) if facts else Status.UNKNOWN
     started_at = facts.started_at if facts else None
     updated_at = (facts.updated_at if facts else None) or entry.updated_at or datetime.now(timezone.utc)
     duration_sec = _duration_sec(started_at, updated_at)
@@ -425,6 +486,23 @@ def _duration_sec(started_at: datetime | None, updated_at: datetime) -> int:
     if started_at is None:
         return 0
     return max(0, int((updated_at - started_at).total_seconds()))
+
+
+def _status_at_time(facts: _SessionFacts | None, now: datetime) -> Status:
+    if facts is None:
+        return Status.UNKNOWN
+
+    status = facts.status
+    if status not in {Status.RUNNING, Status.TOOL_RUNNING, Status.THINKING}:
+        return status
+
+    updated_at = _normalize_datetime(facts.updated_at)
+    started_at = _normalize_datetime(facts.started_at)
+    if updated_at is not None and (now - updated_at).total_seconds() >= STALE_AFTER_SEC:
+        return Status.STALE
+    if started_at is not None and (now - started_at).total_seconds() >= LONG_RUNNING_AFTER_SEC:
+        return Status.LONG_RUNNING
+    return status
 
 
 def _project_id_for_cwd(cwd: str | None) -> str:
@@ -523,6 +601,14 @@ def _parse_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _normalize_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _assistant_text(payload: JsonDict) -> str | None:
     content = payload.get("content")
     if not isinstance(content, list):
@@ -559,6 +645,11 @@ def _short_event_message(payload: JsonDict) -> str | None:
 def _looks_awaiting_user(value: str) -> bool:
     folded = value.lower()
     return any(marker in folded for marker in AWAITING_USER_MARKERS)
+
+
+def _looks_approval_required(value: str) -> bool:
+    folded = value.lower()
+    return any(marker in folded for marker in APPROVAL_REQUIRED_MARKERS)
 
 
 def _looks_failed(value: str) -> bool:
